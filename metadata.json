@@ -1,0 +1,6 @@
+{
+  "name": "SMK Prima Unggul — Sistem Absensi",
+  "description": "Portal profil sekolah dan sistem manajemen absensi siswa serta karyawan SMK Prima Unggul.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
