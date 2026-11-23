@@ -16,6 +16,7 @@ interface AuthContextValue {
   loading: boolean;
   login: (email: string, password: string) => Promise<UserProfile>;
   register: (payload: RegisterPayload) => Promise<UserProfile>;
+  bootstrapDemo: () => Promise<UserProfile>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 }
@@ -68,6 +69,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return res.user;
   }, []);
 
+  const bootstrapDemo = useCallback(async () => {
+    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/bootstrap-demo', {
+      method: 'POST',
+    });
+    setAuthToken(res.token);
+    setUser(res.user);
+    return res.user;
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       if (getAuthToken()) {
@@ -82,7 +92,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, refreshUser }}>
+    <AuthContext.Provider
+      value={{ user, loading, login, register, bootstrapDemo, logout, refreshUser }}
+    >
       {children}
     </AuthContext.Provider>
   );

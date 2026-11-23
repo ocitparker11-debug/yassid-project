@@ -13,6 +13,7 @@ import type {
   StudentAttendanceStatus,
   UserProfile,
 } from '../types.ts';
+import { getCurrentJakartaTime, getTodayJakartaDate } from './date-utils.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const SQLITE_FILE = path.join(DATA_DIR, 'smk_prima_unggul.db');
@@ -37,26 +38,7 @@ export function verifyPassword(password: string, hash: string, salt: string): bo
   return crypto.timingSafeEqual(a, b);
 }
 
-export function getTodayJakartaDate(): string {
-  const now = new Date();
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Jakarta',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(now);
-}
-
-export function getCurrentJakartaTime(): string {
-  const now = new Date();
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Jakarta',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).format(now);
-}
+export { getCurrentJakartaTime, getTodayJakartaDate };
 
 function getPastDate(daysAgo: number): string {
   const d = new Date();

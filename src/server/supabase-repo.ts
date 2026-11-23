@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createClient } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
@@ -11,10 +12,15 @@ import type {
   StudentAttendanceStatus,
   UserProfile,
 } from '../types.ts';
-import { getCurrentJakartaTime, getTodayJakartaDate } from './store.ts';
+import { getCurrentJakartaTime, getTodayJakartaDate } from './date-utils.ts';
 
 let adminClient: SupabaseClient | null = null;
 let authClient: SupabaseClient | null = null;
+const requestTokenStorage = new AsyncLocalStorage<string>();
+
+export function runWithSupabaseUserToken<T>(token: string, fn: () => T): T {
+  return requestTokenStorage.run(token, fn);
+}
 
 function cleanEnv(value: string | undefined): string {
   if (!value) return '';
@@ -51,7 +57,38 @@ export function isSupabaseConfigured(): boolean {
   return Boolean(isValidUrl && isValidAnon && isValidService);
 }
 
-export function getSupabaseConfigStatus(): { configured: boolean; missingKeys: string[] } {
+function classifySupabaseKey(key: string): {
+  format: 'jwt' | 'sb_secret' | 'sb_publishable' | 'other' | 'missing';
+  jwtRole?: string;
+} {
+  if (!key) return { format: 'missing' };
+  if (key.startsWith('sb_secret_')) return { format: 'sb_secret' };
+  if (key.startsWith('sb_publishable_')) return { format: 'sb_publishable' };
+  const parts = key.split('.');
+  if (parts.length === 3 && key.startsWith('eyJ')) {
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+        role?: string;
+      };
+      return { format: 'jwt', jwtRole: payload.role || 'unknown' };
+    } catch {
+      return { format: 'jwt', jwtRole: 'invalid' };
+    }
+  }
+  return { format: 'other' };
+}
+
+export function getSupabaseConfigStatus(): {
+  configured: boolean;
+  missingKeys: string[];
+  keyDiagnostics: {
+    anonKeyFormat: string;
+    anonJwtRole?: string;
+    serviceKeyFormat: string;
+    serviceJwtRole?: string;
+    serviceEqualsAnon: boolean;
+  };
+} {
   const { url, anon, service } = getSupabaseEnv();
   const missingKeys: string[] = [];
   if (!/^https?:\/\/.+/i.test(url) || url.includes('YOUR_PROJECT_REF') || url.includes('MY_SUPABASE_URL')) {
@@ -63,33 +100,103 @@ export function getSupabaseConfigStatus(): { configured: boolean; missingKeys: s
   if (!service || service.includes('YOUR_SUPABASE') || service.includes('MY_SUPABASE')) {
     missingKeys.push('SUPABASE_SERVICE_ROLE_KEY');
   }
+
+  const anonInfo = classifySupabaseKey(anon);
+  const serviceInfo = classifySupabaseKey(service);
+
   return {
     configured: missingKeys.length === 0,
     missingKeys,
+    keyDiagnostics: {
+      anonKeyFormat: anonInfo.format,
+      ...(anonInfo.jwtRole ? { anonJwtRole: anonInfo.jwtRole } : {}),
+      serviceKeyFormat: serviceInfo.format,
+      ...(serviceInfo.jwtRole ? { serviceJwtRole: serviceInfo.jwtRole } : {}),
+      serviceEqualsAnon: Boolean(anon && service && anon === service),
+    },
   };
 }
 
-function getSupabaseAdmin(): SupabaseClient {
+export function hasAdminPrivileges(): boolean {
+  const { service } = getSupabaseEnv();
+  const info = classifySupabaseKey(service);
+  return info.format === 'sb_secret' || (info.format === 'jwt' && info.jwtRole === 'service_role');
+}
+
+function createSupabaseUserClient(userToken: string): SupabaseClient {
+  const { url, anon } = getSupabaseEnv();
+  return createClient(url, anon, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${userToken}`,
+      },
+    },
+  });
+}
+
+function getSupabaseRawAdmin(): SupabaseClient {
   if (!adminClient) {
     const { url, service } = getSupabaseEnv();
+    const isNewKeyFormat = service.startsWith('sb_secret_') || service.startsWith('sb_publishable_');
     adminClient = createClient(url, service, {
       auth: {
         autoRefreshToken: false,
         persistSession: false,
       },
+      ...(isNewKeyFormat
+        ? {
+            global: {
+              fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+                const headers = new Headers(init?.headers);
+                if (headers.get('Authorization') === `Bearer ${service}`) {
+                  headers.delete('Authorization');
+                }
+                return fetch(input, { ...init, headers });
+              },
+            },
+          }
+        : {}),
     });
   }
   return adminClient;
 }
 
+function getSupabaseAdmin(): SupabaseClient {
+  if (!hasAdminPrivileges()) {
+    const activeToken = requestTokenStorage.getStore();
+    if (activeToken) {
+      return createSupabaseUserClient(activeToken);
+    }
+  }
+  return getSupabaseRawAdmin();
+}
+
 function getSupabaseAuth(): SupabaseClient {
   if (!authClient) {
     const { url, anon } = getSupabaseEnv();
+    const isNewPublishable = anon.startsWith('sb_publishable_');
     authClient = createClient(url, anon, {
       auth: {
         autoRefreshToken: false,
         persistSession: false,
       },
+      ...(isNewPublishable
+        ? {
+            global: {
+              fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+                const headers = new Headers(init?.headers);
+                if (headers.get('Authorization') === `Bearer ${anon}`) {
+                  headers.delete('Authorization');
+                }
+                return fetch(input, { ...init, headers });
+              },
+            },
+          }
+        : {}),
     });
   }
   return authClient;
@@ -215,13 +322,18 @@ export async function getAuthStatusSupabase(): Promise<{ hasUsers: boolean; user
   return { hasUsers: total > 0, userCount: total };
 }
 
-async function ensureProfileForAuthUser(authUser: {
-  id: string;
-  email?: string;
-  user_metadata?: Record<string, unknown>;
-}): Promise<UserProfile> {
-  const admin = getSupabaseAdmin();
-  const { data: existing } = await admin
+async function ensureProfileForAuthUser(
+  authUser: {
+    id: string;
+    email?: string;
+    user_metadata?: Record<string, unknown>;
+  },
+  userToken?: string
+): Promise<UserProfile> {
+  const db =
+    !hasAdminPrivileges() && userToken ? createSupabaseUserClient(userToken) : getSupabaseAdmin();
+
+  const { data: existing } = await db
     .from('profiles')
     .select('*')
     .eq('id', authUser.id)
@@ -231,7 +343,7 @@ async function ensureProfileForAuthUser(authUser: {
     return mapProfile(existing as ProfileRow);
   }
 
-  const { count } = await admin.from('profiles').select('*', { count: 'exact', head: true });
+  const { count } = await db.from('profiles').select('*', { count: 'exact', head: true });
   const isFirst = (count || 0) === 0;
   const metaRole = String(authUser.user_metadata?.role || '');
   const assignedRole: Role = isFirst
@@ -251,7 +363,7 @@ async function ensureProfileForAuthUser(authUser: {
         ? 'Guru Mata Pelajaran'
         : 'Tenaga Kependidikan');
 
-  const { data: inserted, error } = await admin
+  const { data: inserted, error } = await db
     .from('profiles')
     .upsert({
       id: authUser.id,
@@ -271,11 +383,11 @@ async function ensureProfileForAuthUser(authUser: {
 }
 
 export async function verifySupabaseToken(token: string): Promise<UserProfile | null> {
-  const admin = getSupabaseAdmin();
-  const { data: userRes, error: authErr } = await admin.auth.getUser(token);
+  const client = hasAdminPrivileges() ? getSupabaseRawAdmin() : getSupabaseAuth();
+  const { data: userRes, error: authErr } = await client.auth.getUser(token);
   if (authErr || !userRes.user) return null;
 
-  return ensureProfileForAuthUser(userRes.user);
+  return ensureProfileForAuthUser(userRes.user, token);
 }
 
 export async function loginWithSupabase(
@@ -285,11 +397,19 @@ export async function loginWithSupabase(
   const auth = getSupabaseAuth();
 
   const { data, error } = await auth.auth.signInWithPassword({ email, password });
-  if (error || !data.session || !data.user) {
+  if (error) {
+    if (error.message.toLowerCase().includes('email not confirmed')) {
+      throw new Error(
+        'Email belum dikonfirmasi di Supabase Auth. Matikan "Confirm email" di Supabase Dashboard atau isi SUPABASE_SERVICE_ROLE_KEY dengan Secret key (sb_secret_... / service_role).'
+      );
+    }
+    throw new Error('Email atau kata sandi salah.');
+  }
+  if (!data.session || !data.user) {
     throw new Error('Email atau kata sandi salah.');
   }
 
-  const profile = await ensureProfileForAuthUser(data.user);
+  const profile = await ensureProfileForAuthUser(data.user, data.session.access_token);
 
   return {
     token: data.session.access_token,
@@ -299,8 +419,13 @@ export async function loginWithSupabase(
 
 export async function signOutSupabase(token: string): Promise<void> {
   try {
-    const admin = getSupabaseAdmin();
-    await admin.auth.admin.signOut(token);
+    if (hasAdminPrivileges()) {
+      const admin = getSupabaseRawAdmin();
+      await admin.auth.admin.signOut(token);
+    } else {
+      const client = createSupabaseUserClient(token);
+      await client.auth.signOut();
+    }
   } catch {
     // ignore signOut errors if token already expired
   }
@@ -324,62 +449,202 @@ export async function registerWithSupabase(input: {
     : input.role === 'guru'
       ? 'guru'
       : 'tenaga_kependidikan';
+  const resolvedJabatan =
+    input.jabatan ||
+    (assignedRole === 'admin'
+      ? 'Administrator Sistem'
+      : assignedRole === 'guru'
+        ? 'Guru Mata Pelajaran'
+        : 'Tenaga Kependidikan');
 
-  const { data: created, error: createErr } = await admin.auth.admin.createUser({
-    email: input.email,
-    password: input.password,
-    email_confirm: true,
-    user_metadata: {
+  if (hasAdminPrivileges()) {
+    const rawAdmin = getSupabaseRawAdmin();
+    const { data: created, error: createErr } = await rawAdmin.auth.admin.createUser({
+      email: input.email,
+      password: input.password,
+      email_confirm: true,
+      user_metadata: {
+        nama: input.nama,
+        role: assignedRole,
+        nip: input.nip || '-',
+        jabatan: resolvedJabatan,
+      },
+    });
+
+    if (createErr || !created.user) {
+      const msg = createErr?.message || '';
+      if (msg.toLowerCase().includes('already') || msg.toLowerCase().includes('registered')) {
+        throw new Error('Email sudah terdaftar di sistem autentikasi.');
+      }
+      throw new Error(msg || 'Gagal mendaftarkan akun di Supabase Auth.');
+    }
+
+    await rawAdmin.from('profiles').upsert({
+      id: created.user.id,
       nama: input.nama,
+      email: input.email,
       role: assignedRole,
       nip: input.nip || '-',
-      jabatan: input.jabatan || '',
+      jabatan: resolvedJabatan,
+    });
+
+    const { data: signInData, error: signInErr } = await auth.auth.signInWithPassword({
+      email: input.email,
+      password: input.password,
+    });
+
+    if (signInErr || !signInData.session || !signInData.user) {
+      throw new Error('Akun berhasil dibuat, silakan masuk melalui halaman login.');
+    }
+
+    const profile = await ensureProfileForAuthUser(signInData.user, signInData.session.access_token);
+    return {
+      token: signInData.session.access_token,
+      user: profile,
+    };
+  }
+
+  const { data: signUpData, error: signUpErr } = await auth.auth.signUp({
+    email: input.email,
+    password: input.password,
+    options: {
+      data: {
+        nama: input.nama,
+        role: assignedRole,
+        nip: input.nip || '-',
+        jabatan: resolvedJabatan,
+      },
     },
   });
 
-  if (createErr || !created.user) {
-    const msg = createErr?.message || '';
+  if (signUpErr || !signUpData.user) {
+    const msg = signUpErr?.message || '';
     if (msg.toLowerCase().includes('already') || msg.toLowerCase().includes('registered')) {
       throw new Error('Email sudah terdaftar di sistem autentikasi.');
     }
     throw new Error(msg || 'Gagal mendaftarkan akun di Supabase Auth.');
   }
 
-  // Ensure profile exists even if trigger wasn't run yet
-  await admin.from('profiles').upsert({
-    id: created.user.id,
-    nama: input.nama,
-    email: input.email,
-    role: assignedRole,
-    nip: input.nip || '-',
-    jabatan:
-      input.jabatan ||
-      (assignedRole === 'admin'
-        ? 'Administrator Sistem'
-        : assignedRole === 'guru'
-          ? 'Guru Mata Pelajaran'
-          : 'Tenaga Kependidikan'),
-  });
-
-  const { data: signInData, error: signInErr } = await auth.auth.signInWithPassword({
-    email: input.email,
-    password: input.password,
-  });
-
-  if (signInErr || !signInData.session) {
-    throw new Error('Akun berhasil dibuat, silakan masuk melalui halaman login.');
+  if (signUpData.session) {
+    const profile = await ensureProfileForAuthUser(
+      signUpData.user,
+      signUpData.session.access_token
+    );
+    return {
+      token: signUpData.session.access_token,
+      user: profile,
+    };
   }
 
-  const { data: profile } = await admin
-    .from('profiles')
-    .select('*')
-    .eq('id', created.user.id)
-    .single();
+  return loginWithSupabase(input.email, input.password);
+}
 
-  return {
-    token: signInData.session.access_token,
-    user: mapProfile(profile as ProfileRow),
-  };
+export async function bootstrapDefaultUsersSupabase(): Promise<{
+  token: string;
+  user: UserProfile;
+}> {
+  const admin = getSupabaseAdmin();
+  const auth = getSupabaseAuth();
+
+  const { count } = await admin.from('profiles').select('*', { count: 'exact', head: true });
+  if ((count || 0) > 0) {
+    throw new Error('Akun pengguna sudah tersedia. Silakan masuk menggunakan email dan kata sandi Anda.');
+  }
+
+  const defaults: Array<{
+    email: string;
+    password: string;
+    nama: string;
+    role: Role;
+    nip: string;
+    jabatan: string;
+  }> = [
+    {
+      email: 'admin@smkprimaunggul.sch.id',
+      password: 'admin123',
+      nama: 'Drs. Hendra Wijaya, M.Pd.',
+      role: 'admin',
+      nip: '197804122005011004',
+      jabatan: 'Kepala Tata Usaha & Administrator',
+    },
+    {
+      email: 'guru@smkprimaunggul.sch.id',
+      password: 'guru123',
+      nama: 'Siti Nurhaliza, S.Kom.',
+      role: 'guru',
+      nip: '198906152014022003',
+      jabatan: 'Guru Produktif TKJ',
+    },
+    {
+      email: 'tendik@smkprimaunggul.sch.id',
+      password: 'tendik123',
+      nama: 'Budi Santoso',
+      role: 'tenaga_kependidikan',
+      nip: '199508092020121002',
+      jabatan: 'Staf Administrasi Akademik',
+    },
+  ];
+
+  if (!hasAdminPrivileges()) {
+    throw new Error(
+      'SUPABASE_SERVICE_ROLE_KEY di Secrets masih berisi Publishable key (sb_publishable_...), bukan Secret key (sb_secret_... / service_role). Ganti SUPABASE_SERVICE_ROLE_KEY dengan Secret key dari Supabase Dashboard → Settings → API Keys untuk membuat 3 akun otomatis, atau langsung daftar sebagai Admin Pertama menggunakan email Gmail aktif pada formulir di atas.'
+    );
+  }
+
+  const rawAdmin = getSupabaseRawAdmin();
+  const { data: authList, error: listErr } = await rawAdmin.auth.admin.listUsers();
+  if (listErr) {
+    throw new Error(listErr.message);
+  }
+
+  for (const item of defaults) {
+    const existingAuth = authList?.users.find(
+      (u) => u.email?.toLowerCase() === item.email.toLowerCase()
+    );
+
+    let userId: string;
+    if (existingAuth) {
+      const { error: updErr } = await rawAdmin.auth.admin.updateUserById(existingAuth.id, {
+        password: item.password,
+        email_confirm: true,
+        user_metadata: {
+          nama: item.nama,
+          role: item.role,
+          nip: item.nip,
+          jabatan: item.jabatan,
+        },
+      });
+      if (updErr) throw new Error(updErr.message);
+      userId = existingAuth.id;
+    } else {
+      const { data: created, error: createErr } = await rawAdmin.auth.admin.createUser({
+        email: item.email,
+        password: item.password,
+        email_confirm: true,
+        user_metadata: {
+          nama: item.nama,
+          role: item.role,
+          nip: item.nip,
+          jabatan: item.jabatan,
+        },
+      });
+      if (createErr || !created.user) {
+        throw new Error(createErr?.message || `Gagal membuat akun ${item.email}.`);
+      }
+      userId = created.user.id;
+    }
+
+    await rawAdmin.from('profiles').upsert({
+      id: userId,
+      nama: item.nama,
+      email: item.email,
+      role: item.role,
+      nip: item.nip,
+      jabatan: item.jabatan,
+    });
+  }
+
+  return loginWithSupabase(defaults[0].email, defaults[0].password);
 }
 
 export async function getDashboardSupabase(user: UserProfile): Promise<DashboardData> {
@@ -756,37 +1021,62 @@ export async function createUserSupabase(input: {
   jabatan: string;
 }): Promise<UserProfile> {
   const admin = getSupabaseAdmin();
-  const { data: created, error: authErr } = await admin.auth.admin.createUser({
-    email: input.email,
-    password: input.password,
-    email_confirm: true,
-    user_metadata: {
-      nama: input.nama,
-      role: input.role,
-      nip: input.nip,
-      jabatan: input.jabatan,
-    },
-  });
+  const resolvedJabatan =
+    input.jabatan ||
+    (input.role === 'admin'
+      ? 'Administrator'
+      : input.role === 'guru'
+        ? 'Guru Mata Pelajaran'
+        : 'Tenaga Kependidikan');
 
-  if (authErr || !created.user) {
-    throw new Error(authErr?.message || 'Gagal membuat user di Supabase Auth.');
+  let createdUserId = '';
+  if (hasAdminPrivileges()) {
+    const rawAdmin = getSupabaseRawAdmin();
+    const { data: created, error: authErr } = await rawAdmin.auth.admin.createUser({
+      email: input.email,
+      password: input.password,
+      email_confirm: true,
+      user_metadata: {
+        nama: input.nama,
+        role: input.role,
+        nip: input.nip,
+        jabatan: resolvedJabatan,
+      },
+    });
+
+    if (authErr || !created.user) {
+      throw new Error(authErr?.message || 'Gagal membuat user di Supabase Auth.');
+    }
+    createdUserId = created.user.id;
+  } else {
+    const auth = getSupabaseAuth();
+    const { data: signUpData, error: signUpErr } = await auth.auth.signUp({
+      email: input.email,
+      password: input.password,
+      options: {
+        data: {
+          nama: input.nama,
+          role: input.role,
+          nip: input.nip,
+          jabatan: resolvedJabatan,
+        },
+      },
+    });
+    if (signUpErr || !signUpData.user) {
+      throw new Error(signUpErr?.message || 'Gagal membuat user di Supabase Auth.');
+    }
+    createdUserId = signUpData.user.id;
   }
 
   const { data: profile, error: profErr } = await admin
     .from('profiles')
     .upsert({
-      id: created.user.id,
+      id: createdUserId,
       nama: input.nama,
       email: input.email,
       role: input.role,
       nip: input.nip || '-',
-      jabatan:
-        input.jabatan ||
-        (input.role === 'admin'
-          ? 'Administrator'
-          : input.role === 'guru'
-            ? 'Guru Mata Pelajaran'
-            : 'Tenaga Kependidikan'),
+      jabatan: resolvedJabatan,
     })
     .select('*')
     .single();
@@ -810,19 +1100,26 @@ export async function updateUserSupabase(
   }
 ): Promise<UserProfile> {
   const admin = getSupabaseAdmin();
-  const { error: authErr } = await admin.auth.admin.updateUserById(id, {
-    email: input.email,
-    ...(input.password ? { password: input.password } : {}),
-    user_metadata: {
-      nama: input.nama,
-      role: input.role,
-      nip: input.nip,
-      jabatan: input.jabatan,
-    },
-  });
+  if (hasAdminPrivileges()) {
+    const rawAdmin = getSupabaseRawAdmin();
+    const { error: authErr } = await rawAdmin.auth.admin.updateUserById(id, {
+      email: input.email,
+      ...(input.password ? { password: input.password } : {}),
+      user_metadata: {
+        nama: input.nama,
+        role: input.role,
+        nip: input.nip,
+        jabatan: input.jabatan,
+      },
+    });
 
-  if (authErr) {
-    throw new Error(authErr.message);
+    if (authErr) {
+      throw new Error(authErr.message);
+    }
+  } else if (input.password) {
+    throw new Error(
+      'Mengubah kata sandi pengguna lain memerlukan Secret key (sb_secret_... / service_role) pada SUPABASE_SERVICE_ROLE_KEY di Secrets.'
+    );
   }
 
   const { data: profile, error: profErr } = await admin
@@ -846,9 +1143,14 @@ export async function updateUserSupabase(
 }
 
 export async function hardDeleteUserSupabase(id: string): Promise<void> {
-  const admin = getSupabaseAdmin();
+  if (!hasAdminPrivileges()) {
+    throw new Error(
+      'Hard delete ke Supabase Authentication memerlukan Secret key (sb_secret_... / service_role) pada SUPABASE_SERVICE_ROLE_KEY di Secrets.'
+    );
+  }
+  const rawAdmin = getSupabaseRawAdmin();
   // Hard delete from Supabase Authentication; ON DELETE CASCADE removes profile & employee_attendance
-  const { error } = await admin.auth.admin.deleteUser(id);
+  const { error } = await rawAdmin.auth.admin.deleteUser(id);
   if (error) {
     throw new Error(error.message);
   }

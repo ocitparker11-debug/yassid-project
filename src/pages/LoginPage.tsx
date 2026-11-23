@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Eye, EyeOff, Lock, Mail, User } from 'lucide-react';
+import { ArrowLeft, Eye, EyeOff, Lock, Mail, User, UserPlus } from 'lucide-react';
 import { ResilientImage } from '../components/ResilientImage';
 import { useAuth } from '../context/AuthContext';
 import { apiFetch } from '../lib/api';
@@ -8,7 +8,7 @@ import { apiFetch } from '../lib/api';
 type AuthMode = 'login' | 'register';
 
 export default function LoginPage() {
-  const { user, login, register } = useAuth();
+  const { user, login, register, bootstrapDemo } = useAuth();
   const navigate = useNavigate();
 
   const [mode, setMode] = useState<AuthMode>('login');
@@ -19,10 +19,12 @@ export default function LoginPage() {
   const [registerRole, setRegisterRole] = useState<'guru' | 'tenaga_kependidikan'>('guru');
   const [showPassword, setShowPassword] = useState(false);
   const [hasUsers, setHasUsers] = useState(true);
-  const [backendMode, setBackendMode] = useState<'supabase-postgresql' | 'sqlite-relational'>(
-    'sqlite-relational'
-  );
+  const [hasAdminKey, setHasAdminKey] = useState(true);
+  const [backendMode, setBackendMode] = useState<
+    'loading' | 'supabase-postgresql' | 'sqlite-relational'
+  >('loading');
   const [submitting, setSubmitting] = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -32,17 +34,27 @@ export default function LoginPage() {
   }, [user, navigate]);
 
   useEffect(() => {
-    apiFetch<{ hasUsers: boolean; backend?: 'supabase-postgresql' | 'sqlite-relational' }>(
-      '/api/auth/status'
-    )
+    apiFetch<{
+      hasUsers: boolean;
+      backend?: 'supabase-postgresql' | 'sqlite-relational';
+      hasAdminPrivileges?: boolean;
+    }>('/api/auth/status')
       .then((res) => {
         setHasUsers(res.hasUsers);
         if (res.backend) setBackendMode(res.backend);
+        if (typeof res.hasAdminPrivileges === 'boolean') {
+          setHasAdminKey(res.hasAdminPrivileges);
+        }
         if (!res.hasUsers) {
           setMode('register');
         }
       })
-      .catch(() => setHasUsers(true));
+      .catch((err) => {
+        setHasUsers(true);
+        if (err instanceof Error && err.message && !err.message.includes('404')) {
+          setError(err.message);
+        }
+      });
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -74,6 +86,19 @@ export default function LoginPage() {
     setEmail(demoEmail);
     setPassword(demoPass);
     setError('');
+  };
+
+  const handleBootstrapDemo = async () => {
+    setError('');
+    setBootstrapping(true);
+    try {
+      await bootstrapDemo();
+      navigate('/app/dashboard', { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Gagal membuat akun awal di Supabase.');
+    } finally {
+      setBootstrapping(false);
+    }
   };
 
   return (
@@ -276,15 +301,53 @@ export default function LoginPage() {
 
           {/* Quick Demo Credentials (Local Mode) or First-Admin Notice */}
           {!hasUsers ? (
-            <div className="mt-8 pt-6 border-t border-slate-200">
-              <p className="text-xs font-semibold text-red-600 mb-1">
-                Inisialisasi Administrator Pertama
-              </p>
-              <p className="text-xs text-slate-600 leading-relaxed">
-                Database belum memiliki akun terdaftar. Pengguna pertama yang didaftarkan melalui
-                formulir di atas otomatis ditetapkan sebagai <strong>Admin</strong> di sistem
-                autentikasi.
-              </p>
+            <div className="mt-8 pt-6 border-t border-slate-200 space-y-3">
+              <div>
+                <p className="text-xs font-semibold text-red-600 mb-1">
+                  Inisialisasi Administrator Pertama
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Database belum memiliki akun terdaftar. Pengguna pertama yang didaftarkan melalui
+                  formulir di atas otomatis ditetapkan sebagai <strong>Admin</strong> di Supabase
+                  Authentication.
+                </p>
+              </div>
+              {backendMode === 'supabase-postgresql' && hasAdminKey && (
+                <div className="p-3.5 rounded-lg border border-slate-200 bg-slate-50 space-y-2.5">
+                  <p className="text-xs text-slate-700 leading-relaxed">
+                    Atau buat 3 akun awal otomatis (Admin, Guru, Tendik) ke Supabase dan langsung
+                    masuk sebagai Administrator:
+                  </p>
+                  <button
+                    type="button"
+                    disabled={bootstrapping || submitting}
+                    onClick={handleBootstrapDemo}
+                    className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-3 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    <UserPlus className="w-3.5 h-3.5 shrink-0" />
+                    <span>
+                      {bootstrapping
+                        ? 'Membuat Akun di Supabase...'
+                        : 'Buat 3 Akun Awal & Masuk (Admin)'}
+                    </span>
+                  </button>
+                </div>
+              )}
+              {backendMode === 'supabase-postgresql' && !hasAdminKey && (
+                <div className="p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 space-y-1.5">
+                  <p className="text-xs font-semibold text-amber-900">
+                    Catatan Konfigurasi Secret Key Supabase
+                  </p>
+                  <p className="text-xs text-amber-800 leading-relaxed">
+                    Untuk membuat akun pertama sekarang, silakan daftar lewat formulir{' '}
+                    <strong>Daftar Akun</strong> di atas memakai email aktif (mis. Gmail). Jika
+                    ingin mengaktifkan fitur Admin User Management penuh &amp; tombol buat akun
+                    otomatis, isi <code>SUPABASE_SERVICE_ROLE_KEY</code> di Secrets dengan{' '}
+                    <strong>Secret key</strong> (<code>sb_secret_...</code> atau{' '}
+                    <code>service_role</code>), bukan Publishable key.
+                  </p>
+                </div>
+              )}
             </div>
           ) : backendMode === 'sqlite-relational' ? (
             <div className="mt-8 pt-6 border-t border-slate-200">
